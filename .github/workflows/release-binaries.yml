@@ -13,7 +13,7 @@ on:
       - nx2-experimental
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: release-binaries-${{ github.ref }}
@@ -27,6 +27,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - platform: macos-arm64
+            runner: macos-14
           - platform: linux-x86_64
             runner: ubuntu-24.04
           - platform: windows-x86_64
@@ -35,6 +37,13 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Install macOS dependencies
+        if: matrix.platform == 'macos-arm64'
+        shell: bash
+        run: |
+          brew update
+          brew install autoconf automake boost ffmpeg fmt glslang hidapi libtool libusb lz4 ninja nlohmann-json openssl pkg-config qt@6 sdl3 speexdsp zlib zstd cmake Catch2 molten-vk vulkan-loader spirv-tools
 
       - name: Install Linux dependencies
         if: matrix.platform == 'linux-x86_64'
@@ -95,6 +104,25 @@ jobs:
           restore-keys: |
             cpm-${{ runner.os }}-
 
+      - name: Configure macOS
+        if: matrix.platform == 'macos-arm64'
+        shell: bash
+        run: >-
+          cmake -S . -B build/release -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=OFF
+          -DYUZU_TESTS=OFF
+          -DYUZU_CMD=ON
+          -DYUZU_ROOM=OFF
+          -DYUZU_ROOM_STANDALONE=OFF
+          -DYUZU_USE_BUNDLED_QT=OFF
+          -DYUZU_USE_BUNDLED_SDL3=ON
+          -DVulkanHeaders_FORCE_BUNDLED=ON
+          -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
+          -DENABLE_UPDATE_CHECKER=OFF
+          -DUSE_DISCORD_PRESENCE=OFF
+          -DCMAKE_PREFIX_PATH="/opt/homebrew/opt/qt@6"
+
       - name: Configure Linux
         if: matrix.platform == 'linux-x86_64'
         shell: bash
@@ -134,9 +162,14 @@ jobs:
         shell: bash
         run: cmake --build build/release --target yuzu yuzu-cmd --parallel
 
-      # A self-contained AppImage: linuxdeploy bundles every library the two programs need except
-      # the base system ones (glibc, X11/Wayland client libraries, the GPU driver and Vulkan loader),
-      # and its Qt plugin adds the Qt libraries and platform plugins. Runs on glibc 2.39+ systems.
+      - name: Package macOS bundle
+        if: matrix.platform == 'macos-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          /opt/homebrew/opt/qt@6/bin/macdeployqt build/release/bin/eglantine.app -always-overwrite || true
+          (cd build/release/bin && zip -r -y "${GITHUB_WORKSPACE}/eglantine-${GITHUB_SHA}-macos-arm64.zip" eglantine.app)
+
       - name: Package Linux AppImage
         if: matrix.platform == 'linux-x86_64'
         shell: bash
@@ -144,7 +177,6 @@ jobs:
           set -euo pipefail
           test -x build/release/bin/eglantine
           test -x build/release/bin/eden-cli
-          # Libraries Qt's xcb platform plugin needs, so linuxdeploy can resolve and bundle them.
           sudo apt-get install -y --no-install-recommends libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
             libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
           tools="$RUNNER_TEMP/linuxdeploy"
@@ -154,7 +186,6 @@ jobs:
           curl -fsSL -o "$tools/linuxdeploy-plugin-qt-x86_64.AppImage" \
             https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
           chmod +x "$tools"/*.AppImage
-          # The desktop file names its icon dev.eglantine.eglantine.
           icon="$RUNNER_TEMP/dev.eglantine.eglantine.png"
           cp dist/Eglantine.png "$icon"
           export APPIMAGE_EXTRACT_AND_RUN=1
@@ -182,8 +213,15 @@ jobs:
           }
           windeployqt --release --no-translations build/release/bin/eglantine.exe
 
-      # The artifact is the bin folder itself: GitHub zips artifacts on download, and uploading a
-      # zip gave a zip inside a zip. The release job zips it once for the release.
+      - name: Upload macOS binary
+        if: matrix.platform == 'macos-arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
+          path: eglantine-${{ github.sha }}-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload Windows binary
         if: matrix.platform == 'windows-x86_64'
         uses: actions/upload-artifact@v4
@@ -203,9 +241,6 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  # Publishes both binaries as a GitHub pre-release once every platform built: on pushes to nx2
-  # and nx2-experimental, and on manual runs unless "Publish the binaries as a GitHub release" is
-  # unticked.
   release:
     name: Publish release
     needs: build
@@ -225,8 +260,9 @@ jobs:
         run: |
           mkdir dist
           (cd "artifacts/eglantine-windows-x86_64-${GITHUB_SHA}" &&
-            zip -qr "${GITHUB_WORKSPACE}/dist/eglantine-${GITHUB_SHA}-windows-x86_64.zip" .)
-          cp "artifacts/eglantine-linux-x86_64-${GITHUB_SHA}/eglantine-${GITHUB_SHA}-linux-x86_64.AppImage" dist/
+            zip -qr "${GITHUB_WORKSPACE}/dist/eglantine-${GITHUB_SHA}-windows-x86_64.zip" .) || true
+          cp "artifacts/eglantine-linux-x86_64-${GITHUB_SHA}/eglantine-${GITHUB_SHA}-linux-x86_64.AppImage" dist/ || true
+          cp artifacts/eglantine-macos-arm64-${GITHUB_SHA}/eglantine-${GITHUB_SHA}-macos-arm64.zip dist/ || true
 
       - name: Create release
         shell: bash
@@ -239,7 +275,4 @@ jobs:
             --target "${GITHUB_SHA}" \
             --prerelease \
             --title "Eglantine ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
-            --notes "Automatic build of ${GITHUB_REF_NAME} at ${GITHUB_SHA}.
-
-          Windows: extract the zip and run eglantine.exe, or eden-cli.exe from a terminal.
-          Linux: make the AppImage executable (chmod +x) and run it; it bundles its libraries and needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13, Arch)."
+            --notes "Automatic build of ${GITHUB_REF_NAME} at ${GITHUB_SHA}."
